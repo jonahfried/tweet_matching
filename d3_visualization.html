@@ -1,0 +1,132 @@
+<html>
+
+<head>
+    <title>d3Testing</title>
+    <meta charset="utf-8">
+    <style>
+        #selection {
+            visibility: hidden;
+            width: 120px;
+            background-color: black;
+            color: #fff;
+            text-align: center;
+            border-radius: 6px;
+            padding: 5px 0;
+
+             /*Position the tooltip */
+            position: absolute;
+            /*z-index: 1; */
+        }
+
+        .selector:active #selection {
+            visibility: visible;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="selector">
+        <span id="selection"></span>
+        <canvas width="3000" height="2000"></canvas>
+    </div>
+    <script src="https://d3js.org/d3.v5.min.js"></script>
+
+    <script>
+        console.log("Loading Data...")
+        var canvas = document.querySelector("canvas"),
+            context = canvas.getContext("2d")
+            width = canvas.width,
+            height = canvas.height;
+
+         var color = d3.scaleOrdinal(d3.schemeCategory20)
+            .range([ "red", "orange", "yellow", "green", "blue","indigo", "purple", "violet", "black", "grey", "brown"]);
+
+        var sim = d3.forceSimulation()
+            .force("link", d3.forceLink().id(function(d) { return d.id; }).strength(.8))
+            .force("charge", d3.forceManyBody().strength(-18))
+            .force("center", d3.forceCenter(width / 2, height / 2))
+            .force("x", d3.forceX().strength(.05))
+            .force("y", d3.forceY().strength(.05));
+
+        d3.json("writeTest.json").then(function(data) {
+            console.log(data)
+
+            sim.nodes(data.nodes).on("tick", ticked);
+            sim.force("link").links(data.links);
+
+            d3.select(canvas)
+                .on("mousemove", mousemoved)
+                // .call(d3.drag()
+                //     .container(canvas)
+                //     .subject(dragsubject)
+                //     .on("start", dragstarted)
+                //     .on("drag", dragged)
+                //     .on("end", dragended));
+
+            function ticked(){
+                context.clearRect(0, 0, width, height);
+
+                context.beginPath();
+                data.links.forEach(drawLink);
+                context.strokeStyle = "#aaa";
+                context.stroke();
+
+                
+                data.nodes.forEach(drawNode);
+                
+                
+            }
+
+            function dragsubject() {
+                return sim.find(d3.event.x, d3.event.y);
+            }
+
+            function mousemoved() {
+                var div = this.parentNode, a = document.getElementById("selection"), m = d3.mouse(this), d = sim.find(m[0], m[1], 40);
+                if (!d) return a.removeAttribute("href"), a.removeAttribute("title");
+                div.setAttribute("title", d.id);
+                // a.setAttribute("title", d.id);
+                a.style.top = (m[1]-10) + "px";
+                a.style.left = (m[0]+25) + "px";
+                a.innerHTML = d.full_text;
+            }
+
+        });
+
+        function dragstarted() {
+            if (!d3.event.active) sim.alphaTarget(0.3).restart();
+            d3.event.subject.fx = d3.event.subject.x;
+            d3.event.subject.fy = d3.event.subject.y;
+        }
+
+        function dragged() {
+          d3.event.subject.fx = d3.event.x;
+          d3.event.subject.fy = d3.event.y;
+        }
+
+        function dragended() {
+          if (!d3.event.active) sim.alphaTarget(0);
+          d3.event.subject.fx = null;
+          d3.event.subject.fy = null;
+        }
+
+        function drawLink(d) {
+          context.moveTo(d.source.x, d.source.y);
+          context.lineTo(d.target.x, d.target.y);
+        }
+
+        function drawNode(d) {
+            context.beginPath();
+            context.strokeStyle = color(d.group);
+            context.fillStyle = color(d.group);
+            context.moveTo(d.x + 3, d.y);
+            context.arc(d.x, d.y, 3, 0, 2 * Math.PI);
+            context.stroke();
+            context.fill();
+        }
+
+    </script>
+
+</body>
+
+</html> 

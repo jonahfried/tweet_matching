@@ -9,6 +9,7 @@ import sys
 import pandas as pd
 import subprocess
 import argparse
+from build_SQL_database import *
 from tqdm import tqdm
 
 MAX_SEEN_VALUE = .50
@@ -16,7 +17,18 @@ MIN_SEEN_VALUE = .01
 MATCH_LENIENCY = .3 #.3
 LSH_LENIENCY = .5
 
-def get_tweets(SAMPLE_SIZE):
+def get_tweets(tweet_query, SAMPLE_SIZE, loops):
+    skips = SAMPLE_SIZE*loops
+    tweets = []
+    for (tweet_id, full_text, person) in tweet_query:
+        if skips > 0:
+            skips -= 1
+            continue 
+        if SAMPLE_SIZE <= 0:
+            break
+        SAMPLE_SIZE -= 1
+        tweets.append({"full_text":full_text, "id_str":str(tweet_id), "user":{"name":person}})
+    return tweets
 #     tweet_file = open("tweets_for_jonah.txt")
 #     loop_stop = SAMPLE_SIZE
 #     tweets = []
@@ -26,16 +38,21 @@ def get_tweets(SAMPLE_SIZE):
 #             break
 #         tweets.append(json.loads(line))
 #     return tweets
-    with open("all_tweets_by_person.pkl", "rb") as file:
-        all_tweets_by_person = pickle.load(file)
-    tweets = []
-    for person_list in all_tweets_by_person.values():
-        for tweet in person_list.values():
-            if SAMPLE_SIZE <= 0:
-                break
-            SAMPLE_SIZE -= 1
-            tweets.append(tweet)
-    return tweets
+
+#     skips = SAMPLE_SIZE*loops
+#     with open("all_tweets_by_person.pkl", "rb") as file:
+#         all_tweets_by_person = pickle.load(file)
+#     tweets = []
+#     for person_list in all_tweets_by_person.values():
+#         for tweet in person_list.values():
+#             if skips > 0:
+#                 skips -= 1
+#                 continue 
+#             if SAMPLE_SIZE <= 0:
+#                 break
+#             SAMPLE_SIZE -= 1
+#             tweets.append(tweet)
+#     return tweets
         
 
 def tweet_to_nameid(tweet):
@@ -67,7 +84,8 @@ def get_words(tweet):
                 
     tweet["word_counts"] = collections.Counter(tweet["words"])
     tweet["minHash"] = set_to_minhash(set(tweet["words"]))
-    tweet["nameid"] = tweet_to_nameid(tweet)
+#     tweet["nameid"] = tweet_to_nameid(tweet)
+    tweet["nameid"] = str(tweet["id_str"])
     tweet["processed"] = False
     return tweet
 
@@ -130,66 +148,84 @@ def output_to_json(write_path, similarities, tweet_data):
     names = dict(zip(uniques, range(len(uniques))))
     json_pool = cf.ProcessPoolExecutor(max_workers=8)
     parsed_results = [json_pool.submit(dict_add_person, similarities[person], person, names, tweet_data[person]["full_text"]) for person in similarities]
-    for node in cf.as_completed(parsed_results):
+    for node in tqdm(cf.as_completed(parsed_results), desc="futures"):
         nodes_and_links["nodes"].append(node.result()[0])
         nodes_and_links["links"].append(node.result()[1])
     nodes_and_links["links"] = [link for links in nodes_and_links["links"] for link in links]
-    
+    json_pool.shutdown()
     
     with open(write_path, "w") as file:
         file.write(json.dumps(nodes_and_links, sort_keys=True, indent=2))
 
 def main(SAMPLE_SIZE, output_type):
-    print("Getting tweets...")
-    tweets = get_tweets(SAMPLE_SIZE)
-    pool = cf.ProcessPoolExecutor()
-    tweet_results = [pool.submit(get_words, tweet) for tweet in tweets]
-    tweet_data = {tweet.result()["nameid"]:tweet.result() for tweet in cf.as_completed(tweet_results)}
+    tweet_data = {}
+    conn = connect_to_database()
+    executor = conn.cursor()
+    executor.execute("SELECT * FROM tweets")
+    tweet_query = executor.fetchall()
+    loops = 0
+    while (len(tweet_data) < SAMPLE_SIZE) and loops < 1:
+        print("Getting tweets...")
+        tweets = get_tweets(tweet_query, SAMPLE_SIZE, loops)
+        pool = cf.ProcessPoolExecutor()
+        tweet_results = [pool.submit(get_words, tweet) for tweet in tweets]
+        for tweet in cf.as_completed(tweet_results):
+            tweet_data[tweet.result()["nameid"]] = tweet.result() 
+        pool.shutdown()
+        
+        word_counts = list(map(lambda d: d["word_counts"], tweet_data.values()))
+        packages = []
+        for i in range(8):
+            packages.append(word_counts[((i) * (SAMPLE_SIZE//8)):(i+1) * (SAMPLE_SIZE//8)])
 
-    word_counts = list(map(lambda d: d["word_counts"], tweet_data.values()))
-    packages = []
-    for i in range(8):
-        packages.append(word_counts[((i) * (SAMPLE_SIZE//8)):(i+1) * (SAMPLE_SIZE//8)])
+        package_pool = cf.ProcessPoolExecutor(max_workers=8)
+        package_results = [package_pool.submit(sum, counts, collections.Counter()) for counts in packages]
+        word_sums = [f.result() for f in cf.as_completed(package_results)]
+        package_pool.shutdown()
+        
+        all_words_seen = sum(word_sums, collections.Counter())
+        words_to_remove = build_people_and_find_words(tweets, all_words_seen)
 
-    package_pool = cf.ProcessPoolExecutor(max_workers=8)
-    package_results = [package_pool.submit(sum, counts, collections.Counter()) for counts in packages]
-    word_sums = [f.result() for f in cf.as_completed(package_results)]
+        print("Removing extraneous...")
+        tweets_to_remove = []
+        for tweet in tqdm(tweet_data.values(), desc="tweets"):
+            for word in words_to_remove:
+                if word in tweet["word_counts"]:
+                    del tweet["word_counts"][word]
+            tweet["square_sum"] = math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values())))
+            if tweet["square_sum"] == 0:
+                tweets_to_remove.append(tweet["nameid"])
 
-    all_words_seen = sum(word_sums, collections.Counter())
-    words_to_remove = build_people_and_find_words(tweets, all_words_seen)
-
-    print("Removing extraneous...")
-    tweets_to_remove = []
-    for tweet in tqdm(tweet_data.values(), desc="tweets"):
-        for word in words_to_remove:
-            if word in tweet["word_counts"]:
-                del tweet["word_counts"][word]
-        tweet["square_sum"] = math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values())))
-        if tweet["square_sum"] == 0:
-            tweets_to_remove.append(tweet["nameid"])
-
-    for nameid in tweets_to_remove:
-        del tweet_data[nameid]
+        for nameid in tweets_to_remove:
+            del tweet_data[nameid]
 
 
-    tweets = tweet_data.values()
+        tweets = tweet_data.values()
 
-    print("Preliminary pairing...")
-    prelim_data = list(map(lambda d:(d["nameid"], set_to_minhash(d["word_counts"])), tweets))
-    prelim_similarities = MinHashLSH(threshold=LSH_LENIENCY, num_perm=128) #.6
-    with prelim_similarities.insertion_session() as session:
-        for (key, minhash) in prelim_data:
-            session.insert(key, minhash)
-    pairs_to_check = {}
-    for tweet in tqdm(tweets):
-        pairs = [match for match in prelim_similarities.query(tweet["minHash"]) if match != tweet["nameid"]]
-        if len(pairs) > 0:
-            pairs_to_check[tweet["nameid"]] = pairs
-            for pair in pairs:
-                if pair not in pairs_to_check:
-                    pairs_to_check[pair] = []
+        print("Preliminary pairing...")
+        prelim_data = list(map(lambda d:(d["nameid"], set_to_minhash(d["word_counts"])), tweets))
+        prelim_similarities = MinHashLSH(threshold=LSH_LENIENCY, num_perm=128) #.6
+        with prelim_similarities.insertion_session() as session:
+            for (key, minhash) in prelim_data:
+                session.insert(key, minhash)
+        pairs_to_check = {}
+        for tweet in tqdm(tweets):
+            pairs = [match for match in prelim_similarities.query(tweet["minHash"]) if match != tweet["nameid"]]
+            if len(pairs) > 0:
+                pairs_to_check[tweet["nameid"]] = pairs
+                for pair in pairs:
+                    if pair not in pairs_to_check:
+                        pairs_to_check[pair] = []
 
-                    
+        tweets_to_remove = []
+        for tweet in tweet_data:
+            if tweet not in pairs_to_check:
+                tweets_to_remove.append(tweet)
+        for tweet in tweets_to_remove:
+            del tweet_data[tweet]
+
+        loops += 1
+        
     print("Sanity Checks...")
     people = list(tweet_data.keys())
     p1 = people[0]
@@ -226,13 +262,15 @@ def main(SAMPLE_SIZE, output_type):
     for comparison in tqdm(cf.as_completed(future_results), desc="futures"):
         result = comparison.result()
         similarities[result[0]][result[1]] = result[2]
-        
+    distance_pool.shutdown()
+    
     for (person, comparisons) in similarities.items():
         for (relation, weight) in comparisons.items():
             if relation not in similarities:
                 similarities[relation] = {}
             if person not in similarities[relation]:
                 similarities[relation][person] = weight
+           
             
     print("Outputting...")
     if output_type == "csv":
@@ -243,6 +281,7 @@ def main(SAMPLE_SIZE, output_type):
     elif output_type == "csv+json":
         similarity_frame = pd.DataFrame(similarities)
         similarity_frame.to_csv("./similarity_matrix.csv", na_rep=1)
+        print("Outputted to csv")
         output_to_json("./writeTest.json", similarities, tweet_data)
     elif output_type == "none":
         print("Did not write data.")
