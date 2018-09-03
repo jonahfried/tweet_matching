@@ -17,43 +17,14 @@ MIN_SEEN_VALUE = .01
 MATCH_LENIENCY = .3 #.3
 LSH_LENIENCY = .5
 
-def get_tweets(tweet_query, SAMPLE_SIZE, loops):
-    skips = SAMPLE_SIZE*loops
+def get_tweets(tweet_query, SAMPLE_SIZE):
     tweets = []
     for (tweet_id, full_text, person) in tweet_query:
-        if skips > 0:
-            skips -= 1
-            continue 
         if SAMPLE_SIZE <= 0:
             break
         SAMPLE_SIZE -= 1
         tweets.append({"full_text":full_text, "id_str":str(tweet_id), "user":{"name":person}})
     return tweets
-#     tweet_file = open("tweets_for_jonah.txt")
-#     loop_stop = SAMPLE_SIZE
-#     tweets = []
-#     for line in tweet_file: 
-#         loop_stop -= 1
-#         if loop_stop < 0:
-#             break
-#         tweets.append(json.loads(line))
-#     return tweets
-
-#     skips = SAMPLE_SIZE*loops
-#     with open("all_tweets_by_person.pkl", "rb") as file:
-#         all_tweets_by_person = pickle.load(file)
-#     tweets = []
-#     for person_list in all_tweets_by_person.values():
-#         for tweet in person_list.values():
-#             if skips > 0:
-#                 skips -= 1
-#                 continue 
-#             if SAMPLE_SIZE <= 0:
-#                 break
-#             SAMPLE_SIZE -= 1
-#             tweets.append(tweet)
-#     return tweets
-        
 
 def tweet_to_nameid(tweet):
     return tweet["user"]["name"] + "~" + tweet["id_str"]
@@ -63,14 +34,9 @@ def set_to_minhash(s):
     for item in s:
         m.update(item.encode("utf-8"))
     return m
-#     encode_pool = cf.ProcessPoolExecutor(max_workers=8)
-#     encodings = [encode_pool.submit((lamda i: i.encode("utf-8")), item) for item in s]
-#     for encoding in cf.as_completed(encodings):
-#             m.update(encoding)
-#     return m
 
 def get_words(tweet):
-    tweet["words"] = []
+    words = []
     tweet["full_text"] = tweet["full_text"]+"."
     last_ind = 0
     for ind in range(len(tweet["full_text"])):
@@ -79,25 +45,14 @@ def get_words(tweet):
                 last_ind += 1
                 continue
             else:
-                tweet["words"].append(tweet["full_text"][last_ind:ind].lower())
+                words.append(tweet["full_text"][last_ind:ind].lower())
                 last_ind = ind+1
                 
-    tweet["word_counts"] = collections.Counter(tweet["words"])
-    tweet["minHash"] = set_to_minhash(set(tweet["words"]))
-#     tweet["nameid"] = tweet_to_nameid(tweet)
+    tweet["word_counts"] = collections.Counter(words)
+    tweet["minHash"] = set_to_minhash(set(words))
     tweet["nameid"] = str(tweet["id_str"])
     tweet["processed"] = False
     return tweet
-
-# def should_tweet_be_processed(tweet, words_to_remove):
-#         for word in words_to_remove:
-#             if word in tweet["word_counts"]:
-#                 del tweet["word_counts"][word]
-#         tweet["square_sum"] = math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values())))
-#         return ((tweet["square_sum"] != 0), tweet)
-
-def determine_usefulness(word, all_words_seen, total_people):
-    return ((all_words_seen[word]/total_people > MAX_SEEN_VALUE) or (all_words_seen[word]/total_people < MIN_SEEN_VALUE))
 
 def build_people_and_find_words(tweets, all_words_seen):
     total_people = len(tweets)
@@ -120,9 +75,6 @@ def cos_dist(tweet1, tweet2):
 def find_sums_for_each_person(tdm):
     square_sums = {tweet["nameid"]:math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values()))) for (tweet, _) in potentials}
     return square_sums
-
-def term_frequency(person):
-    return .5 + (.5*person/person.max())
 
 def strip_id(user):
     ind = -1
@@ -163,68 +115,64 @@ def main(SAMPLE_SIZE, output_type):
     executor = conn.cursor()
     executor.execute("SELECT * FROM tweets")
     tweet_query = executor.fetchall()
-    loops = 0
-    while (len(tweet_data) < SAMPLE_SIZE) and loops < 1:
-        print("Getting tweets...")
-        tweets = get_tweets(tweet_query, SAMPLE_SIZE, loops)
-        pool = cf.ProcessPoolExecutor()
-        tweet_results = [pool.submit(get_words, tweet) for tweet in tweets]
-        for tweet in cf.as_completed(tweet_results):
-            tweet_data[tweet.result()["nameid"]] = tweet.result() 
-        pool.shutdown()
-        
-        word_counts = list(map(lambda d: d["word_counts"], tweet_data.values()))
-        packages = []
-        for i in range(8):
-            packages.append(word_counts[((i) * (SAMPLE_SIZE//8)):(i+1) * (SAMPLE_SIZE//8)])
+    print("Getting tweets...")
+    tweets = get_tweets(tweet_query, SAMPLE_SIZE)
+    pool = cf.ProcessPoolExecutor()
+    tweet_results = [pool.submit(get_words, tweet) for tweet in tweets]
+    for tweet in cf.as_completed(tweet_results):
+        tweet_data[tweet.result()["nameid"]] = tweet.result() 
+    pool.shutdown()
 
-        package_pool = cf.ProcessPoolExecutor(max_workers=8)
-        package_results = [package_pool.submit(sum, counts, collections.Counter()) for counts in packages]
-        word_sums = [f.result() for f in cf.as_completed(package_results)]
-        package_pool.shutdown()
-        
-        all_words_seen = sum(word_sums, collections.Counter())
-        words_to_remove = build_people_and_find_words(tweets, all_words_seen)
+    word_counts = list(map(lambda d: d["word_counts"], tweet_data.values()))
+    packages = []
+    for i in range(8):
+        packages.append(word_counts[((i) * (SAMPLE_SIZE//8)):(i+1) * (SAMPLE_SIZE//8)])
 
-        print("Removing extraneous...")
-        tweets_to_remove = []
-        for tweet in tqdm(tweet_data.values(), desc="tweets"):
-            for word in words_to_remove:
-                if word in tweet["word_counts"]:
-                    del tweet["word_counts"][word]
-            tweet["square_sum"] = math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values())))
-            if tweet["square_sum"] == 0:
-                tweets_to_remove.append(tweet["nameid"])
+    package_pool = cf.ProcessPoolExecutor(max_workers=8)
+    package_results = [package_pool.submit(sum, counts, collections.Counter()) for counts in packages]
+    word_sums = [f.result() for f in cf.as_completed(package_results)]
+    package_pool.shutdown()
 
-        for nameid in tweets_to_remove:
-            del tweet_data[nameid]
+    all_words_seen = sum(word_sums, collections.Counter())
+    words_to_remove = build_people_and_find_words(tweets, all_words_seen)
+
+    print("Removing extraneous...")
+    tweets_to_remove = []
+    for tweet in tqdm(tweet_data.values(), desc="tweets"):
+        for word in words_to_remove:
+            if word in tweet["word_counts"]:
+                del tweet["word_counts"][word]
+        tweet["square_sum"] = math.sqrt(sum(map((lambda x: x**2), tweet["word_counts"].values())))
+        if tweet["square_sum"] == 0:
+            tweets_to_remove.append(tweet["nameid"])
+
+    for nameid in tweets_to_remove:
+        del tweet_data[nameid]
 
 
-        tweets = tweet_data.values()
+    tweets = tweet_data.values()
 
-        print("Preliminary pairing...")
-        prelim_data = list(map(lambda d:(d["nameid"], set_to_minhash(d["word_counts"])), tweets))
-        prelim_similarities = MinHashLSH(threshold=LSH_LENIENCY, num_perm=128) #.6
-        with prelim_similarities.insertion_session() as session:
-            for (key, minhash) in prelim_data:
-                session.insert(key, minhash)
-        pairs_to_check = {}
-        for tweet in tqdm(tweets):
-            pairs = [match for match in prelim_similarities.query(tweet["minHash"]) if match != tweet["nameid"]]
-            if len(pairs) > 0:
-                pairs_to_check[tweet["nameid"]] = pairs
-                for pair in pairs:
-                    if pair not in pairs_to_check:
-                        pairs_to_check[pair] = []
+    print("Preliminary pairing...")
+    prelim_data = list(map(lambda d:(d["nameid"], set_to_minhash(d["word_counts"])), tweets))
+    prelim_similarities = MinHashLSH(threshold=LSH_LENIENCY, num_perm=128) #.6
+    with prelim_similarities.insertion_session() as session:
+        for (key, minhash) in prelim_data:
+            session.insert(key, minhash)
+    pairs_to_check = {}
+    for tweet in tqdm(tweets):
+        pairs = [match for match in prelim_similarities.query(tweet["minHash"]) if match != tweet["nameid"]]
+        if len(pairs) > 0:
+            pairs_to_check[tweet["nameid"]] = pairs
+            for pair in pairs:
+                if pair not in pairs_to_check:
+                    pairs_to_check[pair] = []
 
-        tweets_to_remove = []
-        for tweet in tweet_data:
-            if tweet not in pairs_to_check:
-                tweets_to_remove.append(tweet)
-        for tweet in tweets_to_remove:
-            del tweet_data[tweet]
-
-        loops += 1
+    tweets_to_remove = []
+    for tweet in tweet_data:
+        if tweet not in pairs_to_check:
+            tweets_to_remove.append(tweet)
+    for tweet in tweets_to_remove:
+        del tweet_data[tweet]
         
     print("Sanity Checks...")
     people = list(tweet_data.keys())
@@ -246,7 +194,7 @@ def main(SAMPLE_SIZE, output_type):
             break
     print(cos_dist(tweet_data[p1], tweet_data[p2]))
         
-    
+        
     print("Pairing...")            
     distance_pool = cf.ProcessPoolExecutor(max_workers=8)
     future_results = []
@@ -286,6 +234,7 @@ def main(SAMPLE_SIZE, output_type):
     elif output_type == "none":
         print("Did not write data.")
     print("Completed.")
+    
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Specify how to handle data")
